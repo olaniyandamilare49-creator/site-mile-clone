@@ -1,0 +1,152 @@
+const prettyinsights = (() => {
+    let serverUrl = ""; // Default server
+    let customer_id = null; // To store user identity
+    let property_id = null
+    let user_id = null
+
+    function generateCustomerIdTbx() {
+      return Math.random().toString(36).substring(2, 28);
+    }
+
+    
+    // Initialize tracking with a custom server URL
+    const init = (config = {}) => {
+      if (config.serverUrl) serverUrl = config.serverUrl;
+      if (config.customer_id) customer_id = config.customer_id;
+      if (config.property_id) property_id = config.property_id;
+      
+
+      const customerIdVal = localStorage.getItem('customerId');
+      if (!customerIdVal) {
+        customerIdVal = generateCustomerIdTbx();
+        localStorage.setItem('customerId', customerIdVal);
+      }
+
+      user_id = customerIdVal
+  
+      trackEvent("page_view", {
+        url: window.location.href,
+        referrer: document.referrer,
+      });
+  
+      attachListeners();
+    };
+  
+    // Attach event listeners for automatic tracking
+    const attachListeners = () => {
+
+
+      let lastScrollY = 0;
+      let lastX = 0, lastY = 0;
+      let eventQueue = []; // Stores events before sending in batch
+      let batchSize = 10; // Maximum number of events in one batch
+      let sendInterval = 5000; // Send every 5 seconds
+      
+
+      document.addEventListener("scroll", () => {
+        const scrollDistance = Math.abs(window.scrollY - lastScrollY);
+    
+        if (scrollDistance > 100) { // Only log if scrolled more than 100px
+            lastScrollY = window.scrollY;
+            queueEvent("scroll", { scrollY: window.scrollY, url: window.location.href });
+        }
+    });
+    
+    document.addEventListener("mousemove", (e) => {
+        const distance = Math.sqrt(Math.pow(e.clientX - lastX, 2) + Math.pow(e.clientY - lastY, 2));
+    
+        if (distance > 50) { // Only log if the mouse moved 50px+
+            lastX = e.clientX;
+            lastY = e.clientY;
+
+          
+
+            queueEvent("mousemove", { x: e.clientX, y: e.clientY,    viewportWidth: window.innerWidth,
+              viewportHeight: window.innerHeight, scrollX: window.scrollX,
+              scrollY: window.scrollY,  url: window.location.href });
+        }
+    });
+
+
+    function sendBatch() {     
+      sendBatchEvents(eventQueue);
+      eventQueue = []; // Clear the queue after sending
+  }  
+
+    function queueEvent(eventType, data) {
+      eventQueue.push({ eventType, ...data, timestamp: Date.now() });
+
+      if (eventQueue.length >= batchSize) {
+          sendBatch();
+      }
+  }
+
+
+  setInterval(() => {
+    if (eventQueue.length > 0) {
+        sendBatch();
+    }
+}, sendInterval);
+
+
+
+      document.addEventListener("click", (e) => {
+        let target = e.target.closest("button, a, input[type='submit']");
+        if (target) {
+          trackEvent("click", {
+            element: target.tagName.toLowerCase(),
+            text: target.innerText.trim(),
+            url: target.href || "",
+          });
+        }
+      });
+  
+      document.addEventListener("submit", (e) => {
+        trackEvent("form_submit", {
+          form_action: e.target.action,
+          form_id: e.target.id || null,
+        });
+      });
+    };
+  
+    // Capture and send event data
+    const trackEvent = (eventName, properties = {}) => {
+      let payload = {
+        event_type: eventName,
+        customer_id: customer_id || "anonymous",
+        property_id: property_id || "anonymous",
+        user_id: user_id,
+        properties,
+      };
+  
+   fetch(serverUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+  
+      console.log("Event Tracked:", payload);
+    };
+
+
+    const sendBatchEvents = (batch) => {
+      let payload = {
+
+        customer_id: customer_id || "anonymous",
+        property_id: property_id || "anonymous",
+        user_id: user_id,
+        batch: batch,
+      };
+  
+   fetch(serverUrl + "/batch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+  
+      console.log("Event Tracked:", payload);
+    };
+  
+    return { init, trackEvent };
+  })();
+  

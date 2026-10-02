@@ -1,0 +1,652 @@
+// ===================== CONFIG =====================
+const WS_URL = 'wss://app.prettyinsights.com/api';
+const GEO_URL = 'https://ipapi.co/json/'; // optional; better: do IP intel server-side
+const HEARTBEAT_MIN = 25_000, HEARTBEAT_MAX = 40_000; // jittered heartbeat
+const SCROLL_THROTTLE_MS = 500;
+
+const HONEYPOT_URL = (() => {
+  try {
+    const u = new URL(WS_URL.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:'));
+    // replace trailing /api with /__pi_probe__
+    u.pathname = u.pathname.replace(/\/api\/?$/, '/__pi_probe__');
+    return u.origin + u.pathname; // e.g., https://app.prettyinsights.com/__pi_probe__
+  } catch (e) {
+    return 'https://app.prettyinsights.com/__pi_probe__';
+  }
+})();
+
+// ===================== UTILS ======================
+function randId(n=26){ return Math.random().toString(36).slice(2, 2+n); }
+function now(){ return Date.now(); }
+function jitter(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
+function safeJSONparse(s){ try { return JSON.parse(s); } catch { return null; } }
+
+// Customer/session ids
+let customerId = localStorage.getItem('customerId');
+if (!customerId){ customerId = randId(); localStorage.setItem('customerId', customerId); }
+let sessionId = sessionStorage.getItem('sessionId');
+if (!sessionId){ sessionId = randId(); sessionStorage.setItem('sessionId', sessionId); }
+
+// Basic hash (fast, not cryptographic)
+function xxhash(str){
+  let h = 0x811c9dc5;
+  for (let i=0;i<str.length;i++){ h ^= str.charCodeAt(i); h = (h + (h<<1) + (h<<4) + (h<<7) + (h<<8) + (h<<24))>>>0; }
+  return ('00000000'+h.toString(16)).slice(-8);
+}
+
+// Throttle
+function throttle(fn, delay){
+  let last=0;
+  return (...args)=>{ const t=now(); if (t-last>=delay){ last=t; fn(...args); } };
+}
+
+// Local storage safe check
+function hasLocalStorage(){
+  try {
+    localStorage.setItem('_t','1');
+    localStorage.removeItem('_t');
+    return true;
+  } catch(e){ return false; }
+}
+
+// Cookie roundtrip (set then read on next tick)
+function hasCookies(){
+  try{
+    document.cookie = `__pi_ck=1; path=/; samesite=Lax`;
+    return document.cookie.indexOf('__pi_ck=1')!==-1;
+  }catch(e){ return false; }
+}
+
+function storageSignals(){
+  return {
+    local: hasLocalStorage(),
+    session: typeof sessionStorage !== 'undefined'
+  };
+}
+
+// ===================== CLIENT FINGERPRINTS ======================
+async function getCanvasHash(){
+  try{
+    const c = document.createElement('canvas'); c.width = 240; c.height = 60;
+    const ctx = c.getContext('2d');
+    ctx.textBaseline = 'top'; ctx.font = "16px 'Arial'";
+    ctx.fillStyle = '#f60'; ctx.fillRect(0,0,240,60);
+    ctx.fillStyle = '#069'; ctx.fillText(navigator.userAgent, 2, 2);
+    ctx.strokeStyle = '#fff'; ctx.arc(120,30,20,0,Math.PI*2); ctx.stroke();
+    return xxhash(c.toDataURL());
+  } catch(e){ return null; }
+}
+
+async function getWebGLInfo(){
+  try{
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    if(!gl) return {vendor:null, renderer:null};
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    return {
+      vendor: dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+      renderer: dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER)
+    };
+  } catch(e){ return {vendor:null, renderer:null}; }
+}
+
+async function getAudioFp(){
+  try{
+    const ctx = new (window.OfflineAudioContext||window.webkitOfflineAudioContext)(1, 44100, 44100);
+    const osc = ctx.createOscillator(); osc.type = "triangle"; osc.frequency.value = 1000;
+    const comp = ctx.createDynamicsCompressor(); osc.connect(comp); comp.connect(ctx.destination); osc.start(0);
+    const b = await ctx.startRendering();
+    let sum=0; for(let i=0;i<b.length;i+=100){ sum += Math.abs(b.getChannelData(0)[i]||0); }
+    return xxhash(String(sum));
+  } catch(e){ return null; }
+}
+
+function getClientHintsSync(){
+  const n = navigator;
+  return {
+    ua: n.userAgent || null,
+    uaDataPresent: !!n.userAgentData
+  };
+}
+
+async function getClientHintsAsync(){
+  try{
+    if (!navigator.userAgentData) return {};
+    const brands = navigator.userAgentData.brands || [];
+    const platform = navigator.userAgentData.platform || null;
+    let mobile = null;
+    try { mobile = await navigator.userAgentData.getHighEntropyValues(['mobile']).then(r=>r.mobile).catch(()=>null); } catch(e){}
+    return { brands, platform, mobile };
+  } catch(e){ return {}; }
+}
+
+function getOSFromUA(ua){
+  ua = ua || navigator.userAgent;
+  if (/Windows/i.test(ua)) return 'Windows';
+  if (/Mac OS X|Macintosh/i.test(ua)) return 'Mac';
+  if (/Linux/i.test(ua)) return 'Linux';
+  if (/Android/i.test(ua)) return 'Android';
+  if (/iPhone|iPad|iOS/i.test(ua)) return 'iOS';
+  return 'Unknown';
+}
+
+function getBrowserFromUA(ua){
+  ua = ua || navigator.userAgent;
+  if (/Edg\//.test(ua)) return 'Edge';
+  if (/Chrome\//.test(ua)) return 'Chrome';
+  if (/Safari\//.test(ua) && !/Chrome\//.test(ua)) return 'Safari';
+  if (/Firefox\//.test(ua)) return 'Firefox';
+  if (/OPR\//.test(ua)) return 'Opera';
+  return 'Unknown';
+}
+
+function headlessHints(){
+  const n = navigator, w = window;
+  return {
+    webdriver: !!n.webdriver,
+    languagesEmpty: !n.languages || n.languages.length===0,
+    pluginsLength: (n.plugins && n.plugins.length) || 0,
+    mimeTypesLength: (n.mimeTypes && n.mimeTypes.length) || 0,
+    maxTouchPoints: n.maxTouchPoints || 0,
+    hardwareConcurrency: n.hardwareConcurrency || null,
+    deviceMemory: n.deviceMemory || null,
+    hasChromeObj: !!w.chrome
+  };
+}
+
+function envBasics(){
+  const tz = (Intl.DateTimeFormat().resolvedOptions().timeZone)||null;
+  return {
+    tz,
+    lang: navigator.language || null,
+    screen: { w: screen.width, h: screen.height, dpr: window.devicePixelRatio || 1 },
+    viewport: { w: document.documentElement.clientWidth, h: document.documentElement.clientHeight },
+    ref: document.referrer || null,
+    url: location.href,
+    title: document.title,
+    historyLength: history.length || 0,
+    storage: storageSignals()
+  };
+}
+
+// ============= INTERACTION + BEHAVIOR CAPTURE =============
+const interactions = {
+  firstMouseMs: null,
+  firstKeyMs: null,
+  clicks: 0,
+  keys: 0,
+  mouseMoves: 0,
+  scrollMaxPct: 0,
+  visible: document.visibilityState === 'visible',
+  focus: document.hasFocus(),
+  dwellStart: now()
+};
+
+function updateVisibility(){ interactions.visible = (document.visibilityState === 'visible'); }
+function updateFocus(){ interactions.focus = document.hasFocus(); }
+
+document.addEventListener('visibilitychange', updateVisibility, {passive:true, capture:true});
+window.addEventListener('focus', updateFocus);
+window.addEventListener('blur', updateFocus);
+
+document.addEventListener('mousemove', throttle(()=>{ 
+  interactions.mouseMoves++; 
+  if (interactions.firstMouseMs===null) interactions.firstMouseMs = now() - interactions.dwellStart; 
+}, 300), {passive:true});
+
+document.addEventListener('click', ()=>{ interactions.clicks++; }, {passive:true});
+document.addEventListener('keydown', ()=>{ 
+  interactions.keys++; 
+  if (interactions.firstKeyMs===null) interactions.firstKeyMs = now() - interactions.dwellStart; 
+});
+
+window.addEventListener('scroll', throttle(()=>{
+  const y = window.scrollY || document.documentElement.scrollTop || 0;
+  const max = Math.max(1, document.documentElement.scrollHeight - document.documentElement.clientHeight);
+  const pct = Math.round(100 * y / max);
+  if (pct > interactions.scrollMaxPct) interactions.scrollMaxPct = pct;
+}, SCROLL_THROTTLE_MS), {passive:true});
+
+// ============= GEO (OPTIONAL CLIENT-SIDE) =================
+
+const GEO_CACHE_KEY = '__pi_geo_cache_v2';
+const GEO_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+let __geo_inflight = null; // de-dupe concurrent calls
+
+function readGeoCache(){
+  try{
+    const raw = sessionStorage.getItem(GEO_CACHE_KEY) ||
+                (hasLocalStorage() && localStorage.getItem(GEO_CACHE_KEY));
+    if (!raw) return null;
+    const { ts, value } = JSON.parse(raw);
+    if (Date.now() - ts < GEO_TTL_MS) return value;
+  }catch(_){}
+  return null;
+}
+
+function writeGeoCache(value){
+  // only cache meaningful results
+  const meaningful = value && Object.values(value).some(v => v != null);
+  if (!meaningful) return;
+  const payload = JSON.stringify({ ts: Date.now(), value });
+  try{ sessionStorage.setItem(GEO_CACHE_KEY, payload); }catch(_){}
+  try{ if (hasLocalStorage()) localStorage.setItem(GEO_CACHE_KEY, payload); }catch(_){}
+}
+
+async function fetchJsonSafe(url, timeoutMs=2500){
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try{
+    const r = await fetch(url, { cache:'no-store', credentials:'omit', signal: ctrl.signal });
+    if (!r.ok) return null;
+    return await r.json();
+  }catch(_){ return null; }
+  finally{ clearTimeout(t); }
+}
+
+function norm(o){
+  // enforce the same return shape, defaulting to nulls
+  return {
+    ip:          o?.ip ?? null,
+    asn:         o?.asn ?? null,
+    org:         o?.org ?? null,
+    country:     o?.country ?? null,
+    country_code:o?.country_code ?? null,
+    city:        o?.city ?? null,
+    region:      o?.region ?? null,
+    timezone:    o?.timezone ?? null
+  };
+}
+
+async function tryProvider(url, map){
+  const j = await fetchJsonSafe(url);
+  if (!j) return null;
+  const v = map(j);
+  // ensure we always return full keyset
+  return norm(v);
+}
+
+// Optional token for ipinfo (set once anywhere before calling getGeo)
+/// window.PI_IPINFO_TOKEN = 'YOUR_TOKEN';
+
+async function getGeo(){
+  // 1) cache
+  const cached = readGeoCache();
+  if (cached) return cached;
+
+  // 2) de-dupe in-flight
+  if (__geo_inflight) return __geo_inflight;
+
+  __geo_inflight = (async () => {
+    // Provider chain (stop on first meaningful success)
+    // A) ipwho.is (no key; has region and connection ASN/ORG)
+    const chain = [
+      {
+        url: 'https://ipwho.is/',
+        map: j => ({
+          ip: j.ip || null,
+          asn: j.connection?.asn || null,
+          org: j.connection?.org || j.connection?.isp || null,
+          country: j.country || null,
+          country_code: j.country_code || null,
+          city: j.city || null,
+          region: j.region || j.region_code || null,
+          timezone: j.timezone?.id || j.timezone || null
+        })
+      },
+      // B) your existing provider via GEO_URL (ipapi.co)
+      {
+        url: GEO_URL,
+        map: j => ({
+          ip: j.ip || null,
+          asn: j.asn || null,
+          org: j.org || j.org_name || null,
+          country: j.country_name || j.country || null,
+          country_code: j.country || null,   // ipapi.co uses 2-letter in `country`
+          city: j.city || null,
+          region: j.region || j.region_code || null,
+          timezone: j.timezone || null
+        })
+      },
+      // C) ipinfo.io (optional token)
+      ...(window.PI_IPINFO_TOKEN ? [{
+        url: `https://ipinfo.io/json?token=${encodeURIComponent(window.PI_IPINFO_TOKEN)}`,
+        map: j => {
+          // ipinfo `org` looks like "AS12345 ISP Name" — extract ASN if present
+          const asnMatch = (j.org || '').match(/^AS(\d+)/i);
+          return {
+            ip: j.ip || null,
+            asn: asnMatch ? asnMatch[1] : null,
+            org: j.org || null,
+            country: j.country || null,       // country code; full name not provided on free
+            country_code: j.country || null,
+            city: j.city || null,
+            region: j.region || null,
+            timezone: j.timezone || null
+          };
+        }
+      }] : []),
+      // D) ip-api.com (no key; 45 req/min; includes country + regionName)
+      {
+        url: 'https://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,timezone,as,org,city',
+        map: j => (j.status === 'success') ? ({
+          ip: j.query || null,
+          asn: (j.as || '').replace(/^AS(\d+).*/, '$1') || null,
+          org: j.org || null,
+          country: j.country || null,
+          country_code: j.countryCode || null,
+          city: j.city || null,
+          region: j.regionName || null,
+          timezone: j.timezone || null
+        }) : ({})
+      },
+      // E) country.is (country-only last resort)
+      {
+        url: 'https://country.is/',
+        map: j => ({
+          ip: null,
+          asn: null,
+          org: null,
+          country: j.country || j.country_code || null,
+          country_code: j.country || j.country_code || null,
+          city: null,
+          region: null,
+          timezone: null
+        })
+      }
+    ];
+
+    for (const p of chain){
+      const res = await tryProvider(p.url, p.map);
+      // store only if we have at least a country or region or city
+      if (res && (res.country || res.region || res.city)){
+        writeGeoCache(res);
+        return res;
+      }
+    }
+    return {}; // all failed
+  })();
+
+  try {
+    return await __geo_inflight;
+  } finally {
+    __geo_inflight = null;
+  }
+}
+
+
+// ============= HONEYPOT (client-side signal) ==============
+function injectHoneypot(){
+  try {
+    const a = document.createElement('a');
+    a.href = `${HONEYPOT_URL}?sid=${encodeURIComponent(sessionId)}`;
+    a.rel = 'nofollow noopener noreferrer';
+    a.textContent = 'do-not-click';
+    a.tabIndex = -1;
+    a.setAttribute('aria-hidden', 'true');
+    a.style.cssText = 'position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden;';
+    document.body.appendChild(a);
+  } catch (_) {}
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', injectHoneypot);
+} else {
+  injectHoneypot();
+}
+
+// ============= WEBSOCKET CLIENT + EVENT BUFFER ===========
+let ws, hbTimer=null;
+let lastScrollEventTime = 0;
+
+// ---- Buffer & Flush (keeps server contract: sends as individual {type:'event'}) ----
+const EVENT_BUFFER = [];
+let flushTimer = null;
+const FLUSH_INTERVAL_MS = 1000;         // batch briefly to reduce chatter
+const FAST_FLUSH_MS = 200;              // after key interactions
+let lastActivityAt = now();
+
+// Persist key for unreliably-sent events on exit (same tab navigation)
+const PENDING_KEY = `__pi_pending_${sessionId}`;
+
+function enqueueEvent(evt) {
+  EVENT_BUFFER.push({
+    t: Date.now(),
+    sessionId,
+    customerId,
+    ...evt
+  });
+  scheduleFlush();
+  lastActivityAt = now();
+}
+
+function scheduleFlush(delay = FLUSH_INTERVAL_MS) {
+  clearTimeout(flushTimer);
+  flushTimer = setTimeout(flush, delay);
+}
+
+function flush(reason = 'timer') {
+  clearTimeout(flushTimer);
+  if (!EVENT_BUFFER.length) return;
+  // Send as multiple `event` messages to avoid server changes
+  const batch = EVENT_BUFFER.splice(0, EVENT_BUFFER.length);
+  for (const e of batch) {
+    // Maintain existing server message shape
+    send('event', e);
+  }
+}
+
+// Save any remaining buffer to sessionStorage for same-tab nav continuity
+function persistPendingBuffer() {
+  if (!EVENT_BUFFER.length) return;
+  try {
+    const existing = safeJSONparse(sessionStorage.getItem(PENDING_KEY)) || [];
+    const combined = existing.concat(EVENT_BUFFER);
+    sessionStorage.setItem(PENDING_KEY, JSON.stringify(combined));
+  } catch {}
+}
+
+// On next page in same tab, flush pending ASAP after WS opens
+function flushPendingFromStorage() {
+  try {
+    const pending = safeJSONparse(sessionStorage.getItem(PENDING_KEY));
+    if (pending && pending.length) {
+      for (const e of pending) send('event', e);
+      sessionStorage.removeItem(PENDING_KEY);
+    }
+  } catch {}
+}
+
+// Idle ping (as event) so ultra-short sessions still yield a signal
+setInterval(() => {
+  if (now() - lastActivityAt >= 15000) {
+    enqueueEvent({ type: 'idlePing', data: { visible: interactions.visible, focus: interactions.focus } });
+    flush('idle');
+    lastActivityAt = now();
+  }
+}, 5000);
+
+// ---- Send wrapper ----
+function send(type, data){
+  try{
+    if (ws && ws.readyState === WebSocket.OPEN){
+      ws.send(JSON.stringify({ type, data }));
+    }
+  }catch(e){}
+}
+
+// ---- Heartbeats ----
+function scheduleHeartbeat(){
+  clearTimeout(hbTimer);
+  hbTimer = setTimeout(()=>{
+    const dwellMs = now() - interactions.dwellStart;
+    send('heartbeat', {
+      sessionId, customerId,
+      clicks: interactions.clicks,
+      keys: interactions.keys,
+      mouseMoves: interactions.mouseMoves,
+      scrollMaxPct: interactions.scrollMaxPct,
+      visible: interactions.visible,
+      focus: interactions.focus,
+      dwellMs
+    });
+    scheduleHeartbeat();
+  }, jitter(HEARTBEAT_MIN, HEARTBEAT_MAX));
+}
+
+// First quick heartbeat (5–8s), then fall back to normal
+function scheduleQuickHeartbeat() {
+  setTimeout(() => {
+    const dwellMs = now() - interactions.dwellStart;
+    send('heartbeat', {
+      sessionId, customerId,
+      clicks: interactions.clicks,
+      keys: interactions.keys,
+      mouseMoves: interactions.mouseMoves,
+      scrollMaxPct: interactions.scrollMaxPct,
+      visible: interactions.visible,
+      focus: interactions.focus,
+      dwellMs
+    });
+    scheduleHeartbeat();
+  }, jitter(5000, 8000));
+}
+
+// ---- “Immediate” interaction capture ----
+function sendImmediateInteraction(kind, extra = {}) {
+  enqueueEvent({ type: 'interaction', data: { kind, ...extra, pageTitle: document.title } });
+  scheduleFlush(FAST_FLUSH_MS);
+}
+
+document.addEventListener('pointerdown', (e) => {
+  sendImmediateInteraction('pointerdown', { x: e.clientX, y: e.clientY, button: e.button });
+}, { passive: true });
+
+document.addEventListener('click', (e) => {
+  interactions.clicks++;
+  sendImmediateInteraction('click', { x: e.clientX, y: e.clientY });
+}, { passive: true });
+
+document.addEventListener('keydown', () => {
+  interactions.keys++;
+  if (interactions.firstKeyMs === null) interactions.firstKeyMs = now() - interactions.dwellStart;
+  sendImmediateInteraction('keydown');
+}, { passive: true });
+
+document.addEventListener('mousemove', throttle((e) => {
+  interactions.mouseMoves++;
+  if (interactions.firstMouseMs === null) interactions.firstMouseMs = now() - interactions.dwellStart;
+  // sampled proof of “real” pointer
+  enqueueEvent({ type: 'mousemoveSample', data: { x: e.clientX, y: e.clientY } });
+}, 800), { passive: true });
+
+window.addEventListener('scroll', throttle(() => {
+  const y = window.scrollY || document.documentElement.scrollTop || 0;
+  const max = Math.max(1, document.documentElement.scrollHeight - document.documentElement.clientHeight);
+  const pct = Math.round(100 * y / max);
+  if (pct > interactions.scrollMaxPct) interactions.scrollMaxPct = pct;
+  enqueueEvent({ type: 'scroll', data: { y, pct, pageTitle: document.title } });
+}, SCROLL_THROTTLE_MS), { passive: true });
+
+// Ensure final flush on exit; if WS not open, persist for next page
+function flushOnExit(reason) {
+  try { flush(reason); } catch {}
+  try {
+    if (!ws || ws.readyState !== WebSocket.OPEN) persistPendingBuffer();
+  } catch {}
+}
+window.addEventListener('pagehide', () => flushOnExit('pagehide'), { capture: true });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flushOnExit('hidden');
+}, { capture: true });
+window.addEventListener('beforeunload', () => flushOnExit('beforeunload'));
+
+// ============= HELLO PAYLOAD ======================
+async function gatherAndSendHello(){
+  const basics = envBasics();
+  const hintsSync = getClientHintsSync();
+  const hintsAsync = await getClientHintsAsync();
+  const canvasHash = await getCanvasHash();
+  const webgl = await getWebGLInfo();
+  const audioHash = await getAudioFp();
+  const headless = headlessHints();
+  const geo = await getGeo();
+
+  const hello = {
+    accountId: window.piidsc,
+    propertyId: window.x_abs_propId,
+    customerId,
+    sessionId,
+    pageTitle: basics.title,
+    currentPage: basics.url,
+    refUrl: basics.ref,
+    initial: {
+      tz: basics.tz,
+      storage: basics.storage,
+      lang: basics.lang,
+      screen: basics.screen,
+      viewport: basics.viewport,
+      historyLength: basics.historyLength,
+      ua: hintsSync.ua,
+      browser: getBrowserFromUA(hintsSync.ua),
+      os: getOSFromUA(hintsSync.ua),
+      uaDataPresent: hintsSync.uaDataPresent,
+      uaBrands: hintsAsync.brands || [],
+      uaPlatform: hintsAsync.platform || null,
+      uaMobile: (typeof hintsAsync.mobile==='boolean') ? hintsAsync.mobile : null,
+      headless,
+      canvasHash,
+      webglVendor: webgl.vendor,
+      webglRenderer: webgl.renderer,
+      audioHash,
+      geo // optional
+    }
+  };
+
+  send('hello', hello);
+}
+
+// ============= BOOT THE SOCKET ====================
+(function initWS(){
+  ws = new WebSocket(WS_URL);
+
+  ws.addEventListener('open', async () => {
+    await gatherAndSendHello();
+    // Fast first ping to capture short sessions
+    scheduleQuickHeartbeat();
+
+    // Flush any pending buffered events from earlier navigations in the same tab
+    flushPendingFromStorage();
+
+    // Initial clientInfo
+    send('clientInfo', {
+      accountId: window.piidsc,
+      customerId,
+      propertyId: window.x_abs_propId,
+      browser: getBrowserFromUA(),
+      operatingSystem: getOSFromUA(),
+      ipAddress: location.hostname, // real IP should be set server-side
+      currentPage: location.href,
+      referringSite: document.referrer,
+      pageTitle: document.title
+    });
+  });
+
+  ws.addEventListener('message', (e) => {
+    try{
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'challenge' && msg.data && msg.data.kind === 'cookie-roundtrip'){
+        const val = randId(8);
+        document.cookie = `__pi_chal=${val}; path=/; samesite=Lax`;
+        send('challengeResult', { sessionId, kind: 'cookie-roundtrip', value: val, hasCookies: hasCookies() });
+      }
+    }catch(_){}
+  });
+
+  ws.addEventListener('close', () => { clearTimeout(hbTimer); });
+  ws.addEventListener('error', () => {});
+})();
+ 
+// Optional: copy/paste signals
+document.addEventListener('copy', ()=> enqueueEvent({ type:'copy' }));
+document.addEventListener('paste', ()=> enqueueEvent({ type:'paste' }));
